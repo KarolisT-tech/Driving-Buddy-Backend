@@ -7,16 +7,17 @@ from typing import Optional
 import numpy as np
 
 
-# Keep the existing jaw-clench detection parameters unchanged.
-JAW_MAD_MULTIPLIER = 4.5
-JAW_P95_MULTIPLIER = 1.55
-JAW_BASELINE_MULTIPLIER = 1.85
-JAW_MIN_THRESHOLD_UV = 1.5
+# Stricter jaw-clench parameters so eyelid/brow tension when closing eyes doesn't false-trigger
+JAW_MAD_MULTIPLIER = 6.0
+JAW_P95_MULTIPLIER = 1.90
+JAW_BASELINE_MULTIPLIER = 2.50
+JAW_MIN_THRESHOLD_UV = 2.0
 
-MIN_CLENCH_SECONDS = 0.04
-MAX_CLENCH_SECONDS = 0.55
-JAW_RELEASE_RATIO = 0.65
-MIN_GAP_SECONDS = 0.15
+MIN_CLENCH_SECONDS = 0.09
+MAX_CLENCH_SECONDS = 0.60
+JAW_RELEASE_RATIO = 0.50
+MIN_GAP_SECONDS = 0.20
+MIN_PEAK_FACTOR = 1.15
 
 
 def calculate_jaw_threshold(values: list[float], scale: float):
@@ -87,6 +88,9 @@ class DoubleClenchDetector:
             self.peak = 0.0
 
             if not MIN_CLENCH_SECONDS <= duration <= MAX_CLENCH_SECONDS:
+                return "", duration, peak
+
+            if peak < self.threshold * MIN_PEAK_FACTOR:
                 return "", duration, peak
 
             if self.first_clench_time is None:
