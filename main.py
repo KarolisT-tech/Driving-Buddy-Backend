@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
-"""Run jaw-clench, blink and double-blink detection with BrainAccess HALO."""
+"""Run jaw-clench, blink, double-blink, and drowsiness detection with BrainAccess HALO."""
 
 from __future__ import annotations
 
 import argparse
+import asyncio
 import inspect
 import os
 import sys
+import threading
 import time
 import traceback
 import asyncio
@@ -18,6 +20,7 @@ from collections import deque
 from typing import Optional
 
 import numpy as np
+import websockets
 from scipy.signal import butter, sosfilt
 
 from brainaccess.core.eeg_manager import EEGManager
@@ -26,6 +29,7 @@ from brainaccess.utils import acquisition
 from blink import BlinkDetector, calculate_blink_threshold
 from clench import DoubleClenchDetector, calculate_jaw_threshold
 from double_blink import DoubleBlinkDetector
+from drowsiness import DrowsinessDetector, calculate_drowsiness_baseline
 
 
 # ---------------------------------------------------------------------
@@ -51,7 +55,7 @@ DEFAULT_JAW_DOUBLE_WINDOW = 1.50
 
 # Blink signal filter (same settings as the previous working script).
 BLINK_LOW_HZ = 1.0
-BLINK_HIGH_HZ = 10.0
+BLINK_HIGH_HZ = 8.0
 BLINK_FILTER_ORDER = 4
 DEFAULT_BLINK_K = 4.0
 DEFAULT_BLINK_MIN_EXCESS_UV = 8.0
@@ -126,6 +130,7 @@ def read_new_samples(eeg: acquisition.EEG, last_sample: Optional[int]):
     eeg_microvolts = eeg_volts * 1_000_000.0
     return eeg_microvolts, sample_ids, int(sample_ids[-1]), reset
 
+
 # ---------------------------------------------------------------------
 # SERVER FOR ANDROID CLIENT
 # ---------------------------------------------------------------------
@@ -169,7 +174,6 @@ def send_ws_event(message: str):
 
     async def _broadcast():
         print(f"\n[WS] Sending '{message}' to {len(_ws_clients)} client(s)", flush=True)
-        
         for ws in list(_ws_clients):
             try:
                 await ws.send(message)
@@ -177,6 +181,7 @@ def send_ws_event(message: str):
                 _ws_clients.discard(ws)
 
     asyncio.run_coroutine_threadsafe(_broadcast(), _ws_loop)
+
 
 # ---------------------------------------------------------------------
 # ANDROID EMULATOR SMS TEST INTEGRATION
@@ -393,11 +398,14 @@ def run(args: argparse.Namespace):
 
     jaw_calibration_values: list[float] = []
     blink_calibration_values: list[float] = []
+    o1_calibration_values: list[float] = []
+    o2_calibration_values: list[float] = []
     calibration_start_sample: Optional[int] = None
 
     jaw_detector: Optional[DoubleClenchDetector] = None
     blink_detector: Optional[BlinkDetector] = None
     double_blink_detector: Optional[DoubleBlinkDetector] = None
+    drowsiness_detector: Optional[DrowsinessDetector] = None
     blink_threshold: Optional[float] = None
 
     last_sample: Optional[int] = None
@@ -499,11 +507,35 @@ def run(args: argparse.Namespace):
                             if blink_detector is not None:
                                 blink_detector.clear_buffer()
 
+                            if drowsiness_detector is not None:
+                                drowsiness_detector.clear_buffer()
+
                             if counter_reset:
                                 if blink_detector is not None:
                                     blink_detector.reset_sample_tracking()
                                 if double_blink_detector is not None:
                                     double_blink_detector.reset()
+                                if drowsiness_detector is not None:
+                                    drowsiness_detector.reset()
+
+                        # Feed O1/O2 samples into drowsiness calibration or live detection.
+                        if drowsiness_detector is None:
+                            o1_calibration_values.extend(eeg_uv[:, 2].tolist())
+                            o2_calibration_values.extend(eeg_uv[:, 3].tolist())
+                        else:
+                            drowsy_event = drowsiness_detector.update(
+                                eeg_uv[:, 2],
+                                eeg_uv[:, 3],
+                                time.monotonic(),
+                            )
+                            if drowsy_event is not None:
+                                print(
+                                    f"\nDROWSINESS DETECTED! "
+                                    f"(ratio={drowsy_event.ratio_factor:.2f}x, "
+                                    f"alpha={drowsy_event.alpha_factor:.2f}x)",
+                                    flush=True,
+                                )
+                                send_ws_event("drowsy_alert")
 
                         # Filter new samples only once (no reprocessing of rolling buffer).
                         jaw_filtered, jaw_filter_state = sosfilt(
@@ -548,7 +580,7 @@ def run(args: argparse.Namespace):
                             if not np.isfinite(latest_jaw_rms):
                                 continue
 
-                            # Collect both calibration signals simultaneously.
+                            # Collect calibration signals simultaneously.
                             if jaw_detector is None:
                                 if calibration_start_sample is None:
                                     calibration_start_sample = sample_id
@@ -567,6 +599,11 @@ def run(args: argparse.Namespace):
                                         args.blink_k,
                                         args.blink_min_excess_uv,
                                     )
+                                    drowsy_baseline, drowsy_stats = calculate_drowsiness_baseline(
+                                        o1_calibration_values,
+                                        o2_calibration_values,
+                                        FS,
+                                    )
 
                                     jaw_detector = DoubleClenchDetector(
                                         jaw_thr,
@@ -581,6 +618,10 @@ def run(args: argparse.Namespace):
                                     )
                                     double_blink_detector = DoubleBlinkDetector(
                                         args.blink_double_window
+                                    )
+                                    drowsiness_detector = DrowsinessDetector(
+                                        drowsy_baseline,
+                                        FS,
                                     )
 
                                     status = "NO REQUEST"
@@ -597,6 +638,11 @@ def run(args: argparse.Namespace):
                                         f"MAD={blink_stats['mad']:.2f} µV, "
                                         f"k={args.blink_k:.2f}, "
                                         f"threshold={blink_thr:.2f} µV",
+                                        flush=True,
+                                    )
+                                    print(
+                                        f"  drowsiness baseline ratio={drowsy_stats['baseline_ratio']:.2f}, "
+                                        f"rel_alpha={drowsy_stats['baseline_rel_alpha']:.3f}",
                                         flush=True,
                                     )
                                     print("Status: NO REQUEST", flush=True)
@@ -682,7 +728,10 @@ def run(args: argparse.Namespace):
                                     f"Status: {label} | "
                                     f"jaw RMS: {latest_jaw_rms:6.2f} µV | "
                                     f"jaw threshold: {jaw_detector.threshold:6.2f} µV | "
-                                    f"blink threshold: {blink_threshold:6.2f} µV"
+                                    f"blink threshold: {blink_threshold:6.2f} µV | "
+                                    f"drowsy: {drowsiness_detector.last_score:.2f}/"
+                                    f"{drowsiness_detector.score_threshold:.2f} "
+                                    f"({int(drowsiness_detector.drowsy_level * 100)}%)"
                                 )
 
                         if now - last_new_data_wall > 3.0:
@@ -695,7 +744,7 @@ def run(args: argparse.Namespace):
                                 )
                                 last_warning_wall = now
 
-                        print("\r" + line.ljust(150), end="", flush=True)
+                        print("\r" + line.ljust(170), end="", flush=True)
                         last_status_print = now
 
                     delay = POLL_SECONDS - (time.monotonic() - poll_start)
@@ -731,7 +780,7 @@ def run(args: argparse.Namespace):
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Detect jaw clenches and single/double blinks using BrainAccess HALO."
+        description="Detect jaw clenches, blinks, and drowsiness using BrainAccess HALO."
     )
     parser.add_argument("--device-name", default=os.environ.get("BA_DEVICE", DEFAULT_DEVICE))
     parser.add_argument("--calibration-seconds", type=float, default=8.0)
