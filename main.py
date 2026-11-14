@@ -11,6 +11,8 @@ import time
 import traceback
 import asyncio
 import threading
+import subprocess
+import shutil
 import websockets
 from collections import deque
 from typing import Optional
@@ -177,10 +179,192 @@ def send_ws_event(message: str):
     asyncio.run_coroutine_threadsafe(_broadcast(), _ws_loop)
 
 # ---------------------------------------------------------------------
+# ANDROID EMULATOR SMS TEST INTEGRATION
+# ---------------------------------------------------------------------
+
+DEFAULT_SMS_TARGET = "emulator-5556"
+SMS_MESSAGE = "Clench detected"
+SUPPORTED_EMULATORS = ("emulator-5554", "emulator-5556")
+
+# Protect the EEG loop from waiting on ADB. Only one SMS injection is allowed
+# at a time, so repeated detections cannot start overlapping ADB commands.
+_sms_send_lock = threading.Lock()
+
+
+def resolve_adb_path(configured_path: Optional[str] = None) -> str:
+    """Find the ADB executable, optionally using an explicitly configured path."""
+    if configured_path:
+        resolved = shutil.which(configured_path)
+        if resolved:
+            return resolved
+        if os.path.isfile(os.path.expanduser(configured_path)):
+            return os.path.abspath(os.path.expanduser(configured_path))
+        raise FileNotFoundError(
+            f"ADB was not found at '{configured_path}'. "
+            "Pass the full path with --adb-path or add Android platform-tools to PATH."
+        )
+
+    resolved = shutil.which("adb")
+    if not resolved:
+        raise FileNotFoundError(
+            "ADB was not found in PATH. Add Android SDK platform-tools to PATH "
+            "or provide --adb-path."
+        )
+    return resolved
+
+
+def default_sms_sender(target: str) -> str:
+    """Use the other emulator's console port as the simulated sender address."""
+    return "5554" if target == "emulator-5556" else "5556"
+
+
+def validate_sms_target(adb_path: str, target: str) -> None:
+    """Fail early if the selected emulator is not currently available to ADB."""
+    result = subprocess.run(
+        [adb_path, "devices"],
+        capture_output=True,
+        text=True,
+        timeout=8,
+        check=False,
+    )
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip() or "unknown ADB error"
+        raise RuntimeError(f"Could not query ADB devices: {detail}")
+
+    states = {}
+    for line in result.stdout.splitlines()[1:]:
+        fields = line.split()
+        if len(fields) >= 2:
+            states[fields[0]] = fields[1]
+
+    if states.get(target) != "device":
+        available = ", ".join(
+            f"{serial} ({state})" for serial, state in sorted(states.items())
+        ) or "none"
+        raise RuntimeError(
+            f"Selected SMS target '{target}' is not ready. "
+            f"ADB devices: {available}. Start the emulator and check 'adb devices'."
+        )
+
+
+def build_emulator_sms_command(
+    adb_path: str,
+    target: str,
+    sender_number: str,
+    message: str = SMS_MESSAGE,
+) -> list[str]:
+    """Build an ADB emulator-console command that injects an incoming SMS."""
+    return [
+        adb_path,
+        "-s",
+        target,
+        "emu",
+        "sms",
+        "send",
+        sender_number,
+        message,
+    ]
+
+
+def send_emulator_sms_async(
+    adb_path: str,
+    target: str,
+    sender_number: str,
+    message: str = SMS_MESSAGE,
+) -> None:
+    """Inject an incoming SMS into the selected emulator without blocking EEG."""
+    if not _sms_send_lock.acquire(blocking=False):
+        print(
+            "\n[SMS] A previous emulator SMS command is still running; "
+            "skipping this duplicate trigger.",
+            flush=True,
+        )
+        return
+
+    command = build_emulator_sms_command(
+        adb_path=adb_path,
+        target=target,
+        sender_number=sender_number,
+        message=message,
+    )
+
+    def _send():
+        try:
+            print(
+                f"\n[SMS] Injecting '{message}' into {target} "
+                f"(simulated sender: {sender_number})...",
+                flush=True,
+            )
+            result = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+
+            console_output = result.stdout.strip()
+            console_rejected = console_output.upper().startswith("KO:")
+
+            if result.returncode == 0 and not console_rejected:
+                suffix = f" Output: {console_output}" if console_output else ""
+                print(
+                    f"[SMS] Incoming SMS injected into {target}. "
+                    f"Check the emulator's Messages app.{suffix}",
+                    flush=True,
+                )
+            else:
+                detail = result.stderr.strip() or console_output
+                print(
+                    f"[SMS] Failed to inject SMS into {target} "
+                    f"(exit code {result.returncode}): {detail or 'no ADB details'}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+
+        except subprocess.TimeoutExpired:
+            print(
+                f"[SMS] ADB timed out while sending to {target}.",
+                file=sys.stderr,
+                flush=True,
+            )
+        except Exception as exc:
+            print(
+                f"[SMS] Could not inject SMS: {type(exc).__name__}: {exc}",
+                file=sys.stderr,
+                flush=True,
+            )
+        finally:
+            _sms_send_lock.release()
+
+    threading.Thread(
+        target=_send,
+        name="emulator-sms-sender",
+        daemon=True,
+    ).start()
+
+# ---------------------------------------------------------------------
 # MAIN APPLICATION
 # ---------------------------------------------------------------------
 
 def run(args: argparse.Namespace):
+    adb_path = None
+    sms_sender_number = None
+
+    if not args.disable_emulator_sms:
+        adb_path = resolve_adb_path(args.adb_path)
+        validate_sms_target(adb_path, args.sms_target)
+        sms_sender_number = args.sms_sender or default_sms_sender(args.sms_target)
+        if not sms_sender_number.isdigit():
+            raise ValueError("--sms-sender must contain digits only.")
+        print(
+            f"[SMS] Emulator SMS enabled: target={args.sms_target}, "
+            f"simulated sender={sms_sender_number}, message={SMS_MESSAGE!r}",
+            flush=True,
+        )
+    else:
+        print("[SMS] Emulator SMS is disabled.", flush=True)
+
     if FS / 2 <= BLINK_HIGH_HZ or FS / 2 <= JAW_HIGH_HZ:
         raise RuntimeError("Configured sample rate is too low for the filters.")
 
@@ -454,6 +638,13 @@ def run(args: argparse.Namespace):
                                         "\nDOUBLE JAW CLENCH DETECTED -> LISTENING . . .",
                                         flush=True,
                                     )
+                                    if not args.disable_emulator_sms:
+                                        send_emulator_sms_async(
+                                            adb_path=adb_path,
+                                            target=args.sms_target,
+                                            sender_number=sms_sender_number,
+                                            message=SMS_MESSAGE,
+                                        )
                                     last_status_print = time.monotonic()
 
                         # Detect newly confirmed blink peaks after calibration.
@@ -551,6 +742,27 @@ def parse_args():
     parser.add_argument("--blink-min-excess-uv", type=float, default=DEFAULT_BLINK_MIN_EXCESS_UV)
     parser.add_argument("--blink-double-window", type=float, default=DEFAULT_BLINK_DOUBLE_WINDOW)
     parser.add_argument("--status-interval", type=float, default=1.0)
+    parser.add_argument(
+        "--sms-target",
+        choices=SUPPORTED_EMULATORS,
+        default=DEFAULT_SMS_TARGET,
+        help="Emulator that should receive the simulated incoming SMS (default: %(default)s).",
+    )
+    parser.add_argument(
+        "--sms-sender",
+        default=None,
+        help="Numeric sender address shown by the emulator. Defaults to the other emulator's console port.",
+    )
+    parser.add_argument(
+        "--adb-path",
+        default=None,
+        help="Optional path to adb; by default adb is located through PATH.",
+    )
+    parser.add_argument(
+        "--disable-emulator-sms",
+        action="store_true",
+        help="Disable ADB SMS injection while keeping EEG detection and WebSocket events running.",
+    )
     parser.add_argument("--debug", action="store_true")
     args = parser.parse_args()
 
