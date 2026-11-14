@@ -9,6 +9,9 @@ import os
 import sys
 import time
 import traceback
+import asyncio
+import threading
+import websockets
 from collections import deque
 from typing import Optional
 
@@ -121,6 +124,57 @@ def read_new_samples(eeg: acquisition.EEG, last_sample: Optional[int]):
     eeg_microvolts = eeg_volts * 1_000_000.0
     return eeg_microvolts, sample_ids, int(sample_ids[-1]), reset
 
+# ---------------------------------------------------------------------
+# SERVER FOR ANDROID CLIENT
+# ---------------------------------------------------------------------
+
+WS_PORT = 8765
+_ws_loop: Optional[asyncio.AbstractEventLoop] = None
+_ws_clients: set = set()
+
+
+def start_ws_server(port: int = WS_PORT):
+    def _runner():
+        global _ws_loop
+
+        async def _handler(websocket):
+            _ws_clients.add(websocket)
+            print(f"\n[WS] Android connected: {websocket.remote_address}", flush=True)
+            try:
+                async for _ in websocket:
+                    pass
+            except Exception:
+                pass
+            finally:
+                _ws_clients.discard(websocket)
+                print("\n[WS] Android disconnected", flush=True)
+
+        async def _main():
+            global _ws_loop
+            _ws_loop = asyncio.get_running_loop()
+            async with websockets.serve(_handler, "0.0.0.0", port):
+                print(f"[WS] Listening on ws://0.0.0.0:{port}", flush=True)
+                await asyncio.Future()  # run forever
+
+        asyncio.run(_main())
+
+    threading.Thread(target=_runner, daemon=True).start()
+
+
+def send_ws_event(message: str):
+    if _ws_loop is None:
+        return
+
+    async def _broadcast():
+        print(f"\n[WS] Sending '{message}' to {len(_ws_clients)} client(s)", flush=True)
+        
+        for ws in list(_ws_clients):
+            try:
+                await ws.send(message)
+            except Exception:
+                _ws_clients.discard(ws)
+
+    asyncio.run_coroutine_threadsafe(_broadcast(), _ws_loop)
 
 # ---------------------------------------------------------------------
 # MAIN APPLICATION
@@ -174,6 +228,8 @@ def run(args: argparse.Namespace):
 
     eeg = acquisition.EEG(mode="roll")
     stream_started = False
+
+    start_ws_server(WS_PORT)
 
     print(f"Connecting directly to BrainAccess device: {args.device_name}", flush=True)
     print("Disconnect HALO from BrainAccess Board before running this script.", flush=True)
@@ -409,6 +465,7 @@ def run(args: argparse.Namespace):
                                 gap = double_blink_detector.update(blink_time)
                                 if gap is not None:
                                     print(f"TWO BLINKS (gap: {gap:.2f} s)", flush=True)
+                                    send_ws_event("double_blink")
 
                     now = time.monotonic()
 
