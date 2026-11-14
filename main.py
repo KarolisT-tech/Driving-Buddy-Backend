@@ -26,7 +26,7 @@ from scipy.signal import butter, sosfilt
 from brainaccess.core.eeg_manager import EEGManager
 from brainaccess.utils import acquisition
 
-from blink import BlinkDetector, calculate_blink_threshold
+from blink import BLINK_PEAK_CONFIRM_SECONDS, BlinkDetector, calculate_blink_threshold
 from clench import DoubleClenchDetector, calculate_jaw_threshold
 from double_blink import DoubleBlinkDetector
 from drowsiness import DrowsinessDetector, calculate_drowsiness_baseline
@@ -617,7 +617,8 @@ def run(args: argparse.Namespace):
                                         initial_last_sample=sample_id,
                                     )
                                     double_blink_detector = DoubleBlinkDetector(
-                                        args.blink_double_window
+                                        args.blink_double_window,
+                                        confirm_delay=BLINK_PEAK_CONFIRM_SECONDS + 0.10,
                                     )
                                     drowsiness_detector = DrowsinessDetector(
                                         drowsy_baseline,
@@ -703,6 +704,13 @@ def run(args: argparse.Namespace):
                                 if gap is not None:
                                     print(f"TWO BLINKS (gap: {gap:.2f} s)", flush=True)
                                     send_ws_event("double_blink")
+
+                            # A blink with no second blink inside the window = single blink.
+                            if last_sample is not None and double_blink_detector.poll_single(
+                                last_sample / FS
+                            ):
+                                print("\nONE BLINK -> nearest gas station", flush=True)
+                                send_ws_event("single_blink")
 
                     now = time.monotonic()
 
