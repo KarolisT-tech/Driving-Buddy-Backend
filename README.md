@@ -1,43 +1,37 @@
-# Driving Buddy Backend
+Driving Buddy — Launch Guide
 
-Python backend for BrainAccess HALO jaw-clench and blink detection.
+Frontend Repo: https://github.com/KarolisT-tech/Driving-Buddy-Frontend
+Backend WebSocket Port: 8765 | Default Headset: BA HALO 206
 
-## Run
+Prerequisites
+BrainAccess HALO headset (Bluetooth paired, disconnected from BrainAccess Board)
+Python 3 (brainaccess, numpy, scipy, websockets)
+Android Studio with an Emulator (Google Maps + internet enabled)
 
-Start the selected Android emulators, connect BrainAccess HALO, then run:
+How to Launch
+1. Start the Android Frontend
+Open Driving-Buddy-Frontend in Android Studio.
+Boot your Android Emulator (usually emulator-5554), run the app, and grant Location & SMS permissions.
 
-```bash
-python main.py
-```
-
-The backend starts its Android WebSocket server on port `8765` and connects directly to the configured BrainAccess device (`BA HALO 206` by default).
-
-## Emulator SMS test
-
-When a double jaw clench is detected, the backend injects an emulated incoming SMS with the text `Clench detected` into one selected Android Emulator.
-
-Default recipient:
-
-```bash
-python main.py --sms-target emulator-5556
-```
-
-To select the other emulator:
-
-```bash
-python main.py --sms-target emulator-5554
-```
-
-The default simulated sender address is the other emulator's console port (`5554` or `5556`). Override it with `--sms-sender` if desired. ADB must be available on `PATH`, and the selected emulator must appear as `device` in `adb devices`. To specify a custom ADB executable, use `--adb-path /path/to/adb`.
-
-This uses the Android Emulator console command `sms send` through ADB. It injects an **incoming test SMS** into the selected emulator; it is not a real carrier SMS and does not execute `SmsManager` on the other emulator.
-
-To run EEG detection without injecting test SMS messages:
-
-```bash
+2. Start the Python Backend (main.py)
+With Emulator SMS Test (Windows):
+Powershell
+python main.py --adb-path "$env:LOCALAPPDATA\Android\Sdk\platform-tools\adb.exe" --sms-target emulator-5554
+(If adb is already in PATH, you can omit --adb-path ....)
+Without Emulator SMS (EEG + WebSocket only):
+Powershell
 python main.py --disable-emulator-sms
-```
 
-## Existing Android WebSocket events
+3. Calibrate
+Keep your jaw relaxed and look forward for 8 seconds (natural blinking is fine) until status shows NO REQUEST.
+Controls
+1 Blink: Read latest SMS message
+2 Blinks: Navigate to nearest gas station (Google Maps)
+2 Jaw Clenches: Listening mode + inject test SMS ("Clench detected")
+Automatic: Drowsiness alert (drowsy_alert)
 
-The existing WebSocket server remains on port `8765`. Existing `double_blink` events are unchanged.
+Quick Fixes:
+ADB was not found: Pass --adb-path "$env:LOCALAPPDATA\Android\Sdk\platform-tools\adb.exe" or use --disable-emulator-sms.
+emulator-5556 is not ready: Pass --sms-target emulator-5554 (check adb devices).
+Hard to double-blink: Add --blink-double-window 1.2 --blink-k 3.2.
+HALO won't connect: Ensure it's disconnected from BrainAccess Board first.
