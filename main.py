@@ -703,14 +703,14 @@ def run(args: argparse.Namespace):
                                 gap = double_blink_detector.update(blink_time)
                                 if gap is not None:
                                     print(f"TWO BLINKS (gap: {gap:.2f} s)", flush=True)
-                                    send_ws_event("double_blink")
+                                    send_ws_event("single_blink")
 
                             # A blink with no second blink inside the window = single blink.
                             if last_sample is not None and double_blink_detector.poll_single(
                                 last_sample / FS
                             ):
                                 print("\nONE BLINK -> nearest gas station", flush=True)
-                                send_ws_event("single_blink")
+                                send_ws_event("double_blink")
 
                     now = time.monotonic()
 
